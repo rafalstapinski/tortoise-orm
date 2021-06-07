@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Any, List, Set, Type, cast
 
 from tortoise.exceptions import ConfigurationError
 from tortoise.fields import JSONField, TextField, UUIDField
+from tortoise.indexes import Index
 
 if TYPE_CHECKING:  # pragma: nocoverage
     from tortoise.backends.base.client import BaseDBAsyncClient
@@ -181,7 +182,10 @@ class BaseSchemaGenerator:
         fields_with_index = []
         m2m_tables_for_create = []
         references = set()
+        models_to_create: "List[Type[Model]]" = []
 
+        self._get_models_to_create(models_to_create)
+        models_tables = [model._meta.db_table for model in models_to_create]
         for field_name, column_name in model._meta.fields_db_projection.items():
             field_object = model._meta.fields_map[field_name]
             comment = (
@@ -307,12 +311,15 @@ class BaseSchemaGenerator:
 
         if model._meta.indexes:
             for indexes_list in model._meta.indexes:
-                indexes_to_create = []
-                for field in indexes_list:
-                    field_object = model._meta.fields_map[field]
-                    indexes_to_create.append(field_object.source_field or field)
+                if not isinstance(indexes_list, Index):
+                    indexes_to_create = []
+                    for field in indexes_list:
+                        field_object = model._meta.fields_map[field]
+                        indexes_to_create.append(field_object.source_field or field)
 
-                _indexes.append(self._get_index_sql(model, indexes_to_create, safe=safe))
+                    _indexes.append(self._get_index_sql(model, indexes_to_create, safe=safe))
+                else:
+                    _indexes.append(indexes_list.get_sql(self, model, safe))
 
         field_indexes_sqls = [val for val in list(dict.fromkeys(_indexes)) if val]
 
@@ -341,7 +348,7 @@ class BaseSchemaGenerator:
 
         for m2m_field in model._meta.m2m_fields:
             field_object = cast("ManyToManyFieldInstance", model._meta.fields_map[m2m_field])
-            if field_object._generated:
+            if field_object._generated or field_object.through in models_tables:
                 continue
             m2m_create_string = self.M2M_TABLE_TEMPLATE.format(
                 exists="IF NOT EXISTS " if safe else "",

@@ -8,7 +8,7 @@ from tortoise.exceptions import (
     MultipleObjectsReturned,
     ParamsError,
 )
-from tortoise.expressions import F
+from tortoise.expressions import F, Subquery
 
 # TODO: Test the many exceptions in QuerySet
 # TODO: .filter(intnum_null=None) does not work as expected
@@ -222,13 +222,17 @@ class TestQueryset(test.TestCase):
 
         self.assertEqual(await IntFields.all().count(), 19)
 
-        # TODO: Should DELETE honour limit and offset?
-        # await IntFields.all().order_by('intnum').limit(10).delete()
-        #
-        # self.assertEqual(
-        #     await IntFields.all().order_by('intnum').values_list('intnum', flat=True),
-        #     [10, 13, 16, 19, 22, 25, 28, 31, 34, 37]
-        # )
+    @test.requireCapability(support_update_limit_order_by=True)
+    async def test_delete_limit(self):
+        await IntFields.all().limit(1).delete()
+        self.assertEqual(await IntFields.all().count(), 29)
+
+    @test.requireCapability(support_update_limit_order_by=True)
+    async def test_delete_limit_order_by(self):
+        await IntFields.all().limit(1).order_by("-id").delete()
+        self.assertEqual(await IntFields.all().count(), 29)
+        with self.assertRaises(DoesNotExist):
+            await IntFields.get(intnum=97)
 
     async def test_async_iter(self):
         counter = 0
@@ -330,6 +334,22 @@ class TestQueryset(test.TestCase):
         sql = IntFields.all().sql()
         self.assertRegex(sql, r"^SELECT.+FROM.+")
 
+    @test.requireCapability(support_index_hint=True)
+    async def test_force_index(self):
+        sql = IntFields.filter(pk=1).only("id").force_index("index_name").sql()
+        self.assertEqual(
+            sql,
+            "SELECT `id` `id` FROM `intfields` FORCE INDEX (`index_name`) WHERE `id`=1",
+        )
+
+    @test.requireCapability(support_index_hint=True)
+    async def test_use_index(self):
+        sql = IntFields.filter(pk=1).only("id").use_index("index_name").sql()
+        self.assertEqual(
+            sql,
+            "SELECT `id` `id` FROM `intfields` USE INDEX (`index_name`) WHERE `id`=1",
+        )
+
     @test.requireCapability(support_for_update=True)
     async def test_select_for_update(self):
         sql1 = IntFields.filter(pk=1).only("id").select_for_update().sql()
@@ -390,3 +410,24 @@ class TestQueryset(test.TestCase):
         self.assertEqual(tree.parent.name, parent_node.name)
         self.assertEqual(tree.child.pk, child_node.pk)
         self.assertEqual(tree.child.name, child_node.name)
+
+    @test.requireCapability(dialect="postgres")
+    async def test_postgres_search(self):
+        name = "hello world"
+        await Tournament.create(name=name)
+        ret = await Tournament.filter(name__search="hello").first()
+        self.assertEqual(ret.name, name)
+
+    async def test_subquery_select(self):
+        t1 = await Tournament.create(name="1")
+        ret = (
+            await Tournament.filter(pk=t1.pk)
+            .annotate(ids=Subquery(Tournament.filter(pk=t1.pk).values("id")))
+            .values("ids", "id")
+        )
+        self.assertEqual(ret, [{"id": t1.pk, "ids": t1.pk}])
+
+    async def test_subquery_filter(self):
+        t1 = await Tournament.create(name="1")
+        ret = await Tournament.filter(pk=Subquery(Tournament.filter(pk=t1.pk).values("id"))).first()
+        self.assertEqual(ret, t1)

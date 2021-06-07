@@ -46,6 +46,7 @@ from tortoise.fields.relational import (
 )
 from tortoise.filters import get_filters_for_field
 from tortoise.functions import Function
+from tortoise.indexes import Index
 from tortoise.manager import Manager
 from tortoise.queryset import ExistsQuery, Q, QuerySet, QuerySetSingle
 from tortoise.router import router
@@ -80,7 +81,11 @@ def prepare_default_ordering(meta: "Model.Meta") -> Tuple[Tuple[str, Order], ...
 
 
 def _fk_setter(
-    self: "Model", value: "Optional[Model]", _key: str, relation_field: str, to_field: str
+    self: "Model",
+    value: "Optional[Model]",
+    _key: str,
+    relation_field: str,
+    to_field: str,
 ) -> None:
     setattr(self, relation_field, getattr(value, to_field) if value else None)
     setattr(self, _key, value)
@@ -710,7 +715,11 @@ class Model(metaclass=ModelMeta):
             #  as we already know what we will be doing.
             for key, model_field, field in meta.db_default_fields:
                 value = kwargs[key]
-                setattr(self, model_field, None if value is None else field.field_type(value))
+                setattr(
+                    self,
+                    model_field,
+                    None if value is None else field.field_type(value),
+                )
             # These fields need manual .to_python_value()
             for key, model_field, field in meta.db_complex_fields:
                 setattr(self, model_field, field.to_python_value(kwargs[key]))
@@ -734,6 +743,10 @@ class Model(metaclass=ModelMeta):
         if not self.pk:
             raise TypeError("Model instances without id are unhashable")
         return hash(self.pk)
+
+    def __iter__(self):
+        for field in self._meta.db_fields:
+            yield field, getattr(self, field)
 
     def __eq__(self, other: object) -> bool:
         return type(other) is type(self) and self.pk == other.pk  # type: ignore
@@ -887,7 +900,7 @@ class Model(metaclass=ModelMeta):
         :param force_create: Forces creation of the record
         :param force_update: Forces updating of the record
 
-        :raises IncompleteInstanceError: If the model is partial and the fields are not available for persistance.
+        :raises IncompleteInstanceError: If the model is partial and the fields are not available for persistence.
         :raises IntegrityError: If the model can't be created or updated (specifically if force_create or force_update has been set)
         """
         db = using_db or self._choose_db(True)
@@ -963,10 +976,13 @@ class Model(metaclass=ModelMeta):
         await db.executor_class(model=self.__class__, db=db).fetch_for_list([self], *args)
 
     async def refresh_from_db(
-        self, fields: Optional[Iterable[str]] = None, using_db: Optional[BaseDBAsyncClient] = None
+        self,
+        fields: Optional[Iterable[str]] = None,
+        using_db: Optional[BaseDBAsyncClient] = None,
     ) -> None:
         """
-        Refresh latest data from db.
+        Refresh latest data from db. When this method is called without arguments
+        all db fields of the model are updated to the values currently present in the database.
 
         .. code-block:: python3
 
@@ -982,7 +998,8 @@ class Model(metaclass=ModelMeta):
         db = using_db or self._choose_db()
         qs = QuerySet(self.__class__).using_db(db).only(*(fields or []))
         obj = await qs.get(pk=self.pk)
-        for field in fields or self._meta.fields_map:
+
+        for field in fields or self._meta.db_fields:
             setattr(self, field, getattr(obj, field, None))
 
     @classmethod
@@ -1013,21 +1030,32 @@ class Model(metaclass=ModelMeta):
         :param defaults: Default values to be added to a created instance if it can't be fetched.
         :param using_db: Specific DB connection to use instead of default bound
         :param kwargs: Query parameters.
+        :raises IntegrityError: If create failed
+        :raises TransactionManagementError: If transaction error
         """
         if not defaults:
             defaults = {}
         db = using_db or cls._choose_db(True)
-        async with in_transaction(connection_name=db.connection_name):
-            instance = await cls.filter(**kwargs).first()
-            if instance:
-                return instance, False
+        async with in_transaction(connection_name=db.connection_name) as connection:
             try:
-                return await cls.create(**defaults, **kwargs, using_db=using_db), True
-            except (IntegrityError, TransactionManagementError):
-                # Let transaction close
-                pass
-        # Try after transaction in case transaction error
-        return await cls.get(**kwargs), False
+                return await cls.filter(**kwargs).using_db(connection).get(), False
+            except DoesNotExist:
+                try:
+                    return await cls.create(using_db=connection, **defaults, **kwargs), True
+                except (IntegrityError, TransactionManagementError):
+                    return await cls.filter(**kwargs).using_db(connection).get(), False
+
+    @classmethod
+    def select_for_update(
+        cls, nowait: bool = False, skip_locked: bool = False, of: Tuple[str, ...] = ()
+    ) -> QuerySet[MODEL]:
+        """
+        Make QuerySet select for update.
+
+        Returns a queryset that will lock rows until the end of the transaction,
+        generating a SELECT ... FOR UPDATE SQL statement on supported databases.
+        """
+        return cls._meta.manager.get_queryset().select_for_update(nowait, skip_locked, of)
 
     @classmethod
     async def update_or_create(
@@ -1046,18 +1074,12 @@ class Model(metaclass=ModelMeta):
         if not defaults:
             defaults = {}
         db = using_db or cls._choose_db(True)
-        async with in_transaction(connection_name=db.connection_name):
-            instance = await cls.filter(**kwargs).first()
+        async with in_transaction(connection_name=db.connection_name) as connection:
+            instance = await cls.select_for_update().using_db(connection).get_or_none(**kwargs)
             if instance:
-                await instance.update_from_dict(defaults).save()
+                await instance.update_from_dict(defaults).save(using_db=connection)  # type:ignore
                 return instance, False
-            try:
-                return await cls.create(**defaults, **kwargs, using_db=using_db), True
-            except (IntegrityError, TransactionManagementError):
-                # Let transaction close
-                pass
-        # Try after transaction in case transaction error
-        return await cls.get(**kwargs), False
+        return await cls.get_or_create(defaults, db, **kwargs)
 
     @classmethod
     async def create(cls: Type[MODEL], **kwargs: Any) -> MODEL:
@@ -1129,7 +1151,7 @@ class Model(metaclass=ModelMeta):
         """
         Generates a QuerySet with the filter applied.
 
-        :param args: Q funtions containing constraints. Will be AND'ed.
+        :param args: Q functions containing constraints. Will be AND'ed.
         :param kwargs: Simple filter constraints.
         """
         return cls._meta.manager.get_queryset().filter(*args, **kwargs)
@@ -1139,7 +1161,7 @@ class Model(metaclass=ModelMeta):
         """
         Generates a QuerySet with the exclude applied.
 
-        :param args: Q funtions containing constraints. Will be AND'ed.
+        :param args: Q functions containing constraints. Will be AND'ed.
         :param kwargs: Simple filter constraints.
         """
         return cls._meta.manager.get_queryset().exclude(*args, **kwargs)
@@ -1169,7 +1191,7 @@ class Model(metaclass=ModelMeta):
 
             user = await User.get(username="foo")
 
-        :param args: Q funtions containing constraints. Will be AND'ed.
+        :param args: Q functions containing constraints. Will be AND'ed.
         :param kwargs: Simple filter constraints.
 
         :raises MultipleObjectsReturned: If provided search returned more than one object.
@@ -1186,7 +1208,7 @@ class Model(metaclass=ModelMeta):
 
             result = await User.exists(username="foo")
 
-        :param args: Q funtions containing constraints. Will be AND'ed.
+        :param args: Q functions containing constraints. Will be AND'ed.
         :param kwargs: Simple filter constraints.
         """
         return cls._meta.manager.get_queryset().filter(*args, **kwargs).exists()
@@ -1198,9 +1220,9 @@ class Model(metaclass=ModelMeta):
 
         .. code-block:: python3
 
-            user = await User.get(username="foo")
+            user = await User.get_or_none(username="foo")
 
-        :param args: Q funtions containing constraints. Will be AND'ed.
+        :param args: Q functions containing constraints. Will be AND'ed.
         :param kwargs: Simple filter constraints.
         """
         return cls._meta.manager.get_queryset().get_or_none(*args, **kwargs)
@@ -1243,12 +1265,14 @@ class Model(metaclass=ModelMeta):
         if not isinstance(_together, (tuple, list)):
             raise ConfigurationError(f"'{cls.__name__}.{together}' must be a list or tuple.")
 
-        if any(not isinstance(unique_fields, (tuple, list)) for unique_fields in _together):
+        if any(not isinstance(unique_fields, (tuple, list, Index)) for unique_fields in _together):
             raise ConfigurationError(
                 f"All '{cls.__name__}.{together}' elements must be lists or tuples."
             )
 
         for fields_tuple in _together:
+            if isinstance(fields_tuple, Index):
+                fields_tuple = fields_tuple.fields
             for field_name in fields_tuple:
                 field = cls._meta.fields_map.get(field_name)
 
@@ -1270,7 +1294,7 @@ class Model(metaclass=ModelMeta):
 
         :param serializable:
             ``False`` if you want raw python objects,
-            ``True`` for JSON-serialisable data. (Defaults to ``True``)
+            ``True`` for JSON-serializable data. (Defaults to ``True``)
 
         :return:
             A dictionary containing the model description.

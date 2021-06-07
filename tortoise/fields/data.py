@@ -439,7 +439,7 @@ class JSONField(Field, dict, list):  # type: ignore
 
     """
 
-    SQL_TYPE = "TEXT"
+    SQL_TYPE = "JSON"
     indexable = False
 
     class _db_postgres:

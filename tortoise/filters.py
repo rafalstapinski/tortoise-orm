@@ -153,6 +153,11 @@ def contains(field: Term, value: str) -> Criterion:
     return Like(Cast(field, SqlTypes.VARCHAR), field.wrap_constant(f"%{escape_like(value)}%"))
 
 
+def search(field: Term, value: str):
+    # will be override in each executor
+    pass
+
+
 def starts_with(field: Term, value: str) -> Criterion:
     return Like(Cast(field, SqlTypes.VARCHAR), field.wrap_constant(f"{escape_like(value)}%"))
 
@@ -289,6 +294,18 @@ def get_backward_fk_filters(field_name: str, field: BackwardFKRelation) -> Dict[
             "table": Table(field.related_model._meta.db_table),
             "value_encoder": partial(related_list_encoder, field=target_table_pk),
         },
+        f"{field_name}__isnull": {
+            "field": field.related_model._meta.pk_attr,
+            "backward_key": field.relation_field,
+            "operator": is_null,
+            "table": Table(field.related_model._meta.db_table),
+        },
+        f"{field_name}__not_isnull": {
+            "field": field.related_model._meta.pk_attr,
+            "backward_key": field.relation_field,
+            "operator": not_null,
+            "table": Table(field.related_model._meta.db_table),
+        },
     }
 
 
@@ -373,6 +390,12 @@ def get_filters_for_field(
             "field": actual_field_name,
             "source_field": source_field,
             "operator": starts_with,
+            "value_encoder": string_encoder,
+        },
+        f"{field_name}__search": {
+            "field": actual_field_name,
+            "source_field": source_field,
+            "operator": search,
             "value_encoder": string_encoder,
         },
         f"{field_name}__endswith": {
